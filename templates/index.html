@@ -47,6 +47,7 @@
     color: #a40e26; font-size: 14px; line-height: 1.8;
   }
   #summary, #beatSummary, #segmentSummary { font-size: 14px; color: #1a7f37; margin: 0 0 10px; font-weight: 600; }
+  #metroStatus { font-size: 14px; color: #57606a; align-self: center; }
   table {
     width: 100%; border-collapse: collapse; background: #fff;
     border: 1px solid #d0d7de; border-radius: 8px; overflow: hidden;
@@ -83,6 +84,20 @@
     <button id="exampleBtn">填入示例</button>
     <button id="clearBtn">清空</button>
     <button id="csvBtn" disabled>下载 CSV</button>
+  </div>
+
+  <h2>实时节拍器</h2>
+  <p class="hint">
+    点击播放后，按当前乐谱与临时变速方案先调用展开接口取得总时长，
+    再以左闭右开的短时间窗滚动调用拍点接口，用 Web Audio 音频时钟预排程发声：
+    从演奏 0 毫秒开始，每小节首拍为高音、其余拍为低音。
+    拍点按演奏序号与拍序去重，跨时间窗与反复回跳不漏拍、不重拍；
+    停止、修改乐谱或方案会取消尚未发声的拍点，播放到曲终自动停止。
+  </p>
+  <div class="toolbar">
+    <button id="playBtn" class="primary">▶ 播放</button>
+    <button id="stopBtn" disabled>■ 停止</button>
+    <span id="metroStatus"></span>
   </div>
   <div id="errors"></div>
   <p id="summary"></p>
@@ -139,12 +154,14 @@ let lastRows = [];
 
 $("expandBtn").addEventListener("click", doExpand);
 $("clearBtn").addEventListener("click", () => {
+  metroInvalidate("乐谱已修改，播放已停止");
   $("input").value = "";
   $("tempo").value = "";
   reset();
   $("input").focus();
 });
 $("exampleBtn").addEventListener("click", () => {
+  metroInvalidate("乐谱已修改，播放已停止");
   $("input").value = ["1[4@120]", "2", "|:3", "4[2]", "|:5", "6:|x3", "7:|x2[4@90]", "8"].join("\n");
   doExpand();
 });
@@ -156,6 +173,187 @@ for (const id of ["startMs", "endMs"]) {
 $("segmentsBtn").addEventListener("click", doSegmentQuery);
 for (const id of ["startNum", "endNum"]) {
   $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") doSegmentQuery(); });
+}
+
+// ---- 实时节拍器 ----
+const METRO_WINDOW_MS = 1000;    // 每次拍点请求的短时间窗（左闭右开）
+const METRO_LOOKAHEAD_MS = 800;  // 预排程余量：始终领先音频时钟该毫秒数
+const METRO_TICK_MS = 200;       // 排程器巡检间隔
+const METRO_FIRST_FREQ = 1760;   // 首拍（高音）
+const METRO_OTHER_FREQ = 880;    // 其余拍（低音）
+
+const metro = {
+  session: 0,          // 播放会话号：停止或修改输入时递增，使过期请求失效
+  playing: false,
+  starting: false,     // 展开请求进行中，防止重复点击
+  ctx: null,           // AudioContext（首次播放时创建）
+  startTime: 0,        // 演奏 0 毫秒对应的音频时钟时刻（秒）
+  totalMs: 0,          // 全曲总时长（毫秒），来自展开接口
+  cursorMs: 0,         // 已请求到的时间窗右端（毫秒）
+  timer: null,         // 排程器 setInterval 句柄
+  input: "",           // 本次播放会话使用的乐谱快照
+  tempo: "",           // 本次播放会话使用的临时变速方案快照
+  scheduled: new Set(),  // 已排程拍点键 "演奏序号:拍序"，跨窗口与反复回跳去重
+  sources: new Set(),    // 已排程未发声的音频节点，停止时统一取消
+};
+
+$("playBtn").addEventListener("click", metroPlay);
+$("stopBtn").addEventListener("click", () => metroStop("已停止"));
+// 修改乐谱或临时变速方案：取消尚未发声的拍点并停止播放
+for (const id of ["input", "tempo"]) {
+  $(id).addEventListener("input", () => metroInvalidate("乐谱或方案已修改，播放已停止"));
+}
+
+// 使当前播放会话失效：进行中的请求不再排程，未发声的拍点被取消
+function metroInvalidate(message) {
+  metro.session++;
+  if (metro.playing) metroStop(message);
+}
+
+async function metroPlay() {
+  if (metro.playing || metro.starting) return;
+  metro.starting = true;
+  try {
+    $("errors").innerHTML = "";
+    const session = ++metro.session;  // 使此前所有进行中的请求过期
+    // 播放前快照当前乐谱与方案，本次会话的所有请求共用
+    metro.input = $("input").value;
+    metro.tempo = $("tempo").value;
+
+    // 先调展开接口：校验输入并取得总时长（用于曲终自动停止）
+    let data;
+    try {
+      const resp = await fetch("/api/expand", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ input: metro.input, tempo: metro.tempo }),
+      });
+      data = await resp.json();
+    } catch (e) {
+      showErrors([{ line: null, message: "请求失败：" + e }]);
+      return;
+    }
+    if (session !== metro.session) return;  // 等待期间已被停止或修改
+    if (!data.ok) {
+      showErrors(data.errors || []);
+      return;
+    }
+
+    if (!metro.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      metro.ctx = new AC();
+    }
+    await metro.ctx.resume();
+    if (session !== metro.session) return;
+
+    metro.totalMs = data.rows.length ? data.rows[data.rows.length - 1].end_ms : 0;
+    metro.startTime = metro.ctx.currentTime + 0.1;  // 留启动余量，首拍从 0 毫秒准点发声
+    metro.cursorMs = 0;
+    metro.scheduled.clear();
+    metro.playing = true;
+    $("playBtn").disabled = true;
+    $("stopBtn").disabled = false;
+    metro.timer = setInterval(() => metroTick(session), METRO_TICK_MS);
+    metroTick(session);  // 立即排程首个时间窗
+  } finally {
+    metro.starting = false;
+  }
+}
+
+function metroTick(session) {
+  if (session !== metro.session || !metro.playing) return;
+  const nowMs = (metro.ctx.currentTime - metro.startTime) * 1000;
+  if (nowMs >= metro.totalMs) {  // 曲终自动停止
+    metroStop("播放完毕");
+    return;
+  }
+  $("metroStatus").textContent =
+    `播放中… ${(Math.max(0, nowMs) / 1000).toFixed(1)} / ${(metro.totalMs / 1000).toFixed(1)} 秒`;
+  // 滚动请求左闭右开的短时间窗，始终领先音频时钟一个预排程余量
+  while (metro.cursorMs < nowMs + METRO_LOOKAHEAD_MS && metro.cursorMs < metro.totalMs) {
+    const start = metro.cursorMs;
+    const end = Math.min(start + METRO_WINDOW_MS, metro.totalMs);
+    metro.cursorMs = end;
+    metroFetchWindow(session, start, end);
+  }
+}
+
+async function metroFetchWindow(session, start, end) {
+  let data;
+  try {
+    const resp = await fetch("/api/beats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: metro.input,
+        tempo: metro.tempo,
+        start_ms: start,
+        end_ms: end,
+      }),
+    });
+    data = await resp.json();
+  } catch (e) {
+    if (session === metro.session) {
+      showErrors([{ line: null, message: "请求失败：" + e }]);
+      metroStop("请求失败，播放已停止");
+    }
+    return;
+  }
+  if (session !== metro.session) return;  // 过期请求不再排程
+  if (!data.ok) {
+    showErrors(data.errors || []);
+    metroStop("接口报错，播放已停止");
+    return;
+  }
+  for (const b of data.beats) metroSchedule(b);
+}
+
+function metroSchedule(b) {
+  const key = b.seq + ":" + b.beat;  // 按演奏序号与拍序去重
+  if (metro.scheduled.has(key)) return;  // 跨窗口或反复回跳的重复拍点不再发声
+  metro.scheduled.add(key);
+  const ctx = metro.ctx;
+  const t = metro.startTime + b.time_ms / 1000;  // 以音频时钟为准预排程
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.value = b.first ? METRO_FIRST_FREQ : METRO_OTHER_FREQ;
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(0.6, t + 0.005);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(t);
+  osc.stop(t + 0.1);
+  const node = { osc, gain };
+  metro.sources.add(node);
+  osc.onended = () => {
+    metro.sources.delete(node);
+    osc.disconnect();
+    gain.disconnect();
+  };
+}
+
+function metroStop(message) {
+  if (!metro.playing) return;
+  metro.session++;  // 使进行中的拍点请求过期，不再排程
+  metro.playing = false;
+  clearInterval(metro.timer);
+  metro.timer = null;
+  // 取消尚未发声的拍点：增益快速淡出后停止，避免爆音
+  const now = metro.ctx.currentTime;
+  for (const node of metro.sources) {
+    try {
+      node.gain.gain.cancelScheduledValues(now);
+      node.gain.gain.setTargetAtTime(0, now, 0.01);
+      node.osc.stop(now + 0.05);
+    } catch (e) { /* 已结束的节点忽略 */ }
+  }
+  metro.sources.clear();
+  metro.scheduled.clear();
+  $("playBtn").disabled = false;
+  $("stopBtn").disabled = true;
+  $("metroStatus").textContent = message || "";
 }
 
 function reset() {
